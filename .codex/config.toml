@@ -1,0 +1,55 @@
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 6
+
+[agents.tim]
+description = "Tim — Director of Data; diplomatic business alignment and stakeholders."
+config_file = "agents/tim.toml"
+
+[agents.ed]
+description = "Ed — Project Manager and Agent Coordinator; task allocation and parallel execution."
+config_file = "agents/ed.toml"
+
+[agents.ralph]
+description = "Ralph — Senior Data Analyst; SQL, Snowflake, dbt, metrics, and reporting."
+config_file = "agents/ralph.toml"
+
+[agents.carlos]
+description = "Carlos — Senior Principal Data Scientist; modelling, statistics, and ML."
+config_file = "agents/carlos.toml"
+
+[agents.teddy]
+description = "Teddy — Senior Software Engineer; applications, APIs, infrastructure, and CI/CD."
+config_file = "agents/teddy.toml"
+
+[agents.david]
+description = "David — Creative Designer; UX, interfaces, and interaction design."
+config_file = "agents/david.toml"
+
+[agents.will]
+description = "Will — Learning Design Specialist; learning science and assessment."
+config_file = "agents/will.toml"
+
+[agents.eleanor]
+description = "Eleanor — QA Engineer; acceptance, functional, integration, and regression testing."
+config_file = "agents/eleanor.toml"
+
+[agents.hadrian]
+description = "Hadrian — Software Architect; system design and technical trade-offs."
+config_file = "agents/hadrian.toml"
+
+[agents.renato]
+description = "Renato — Product Manager; user needs, requirements, and prioritisation."
+config_file = "agents/renato.toml"
+
+[agents.demis]
+description = "Demis — AI Research and Innovation Visionary; frontier research and experiments."
+config_file = "agents/demis.toml"
+
+[agents.radek]
+description = "Radek — Principal Data Engineer; data architecture and reliable pipelines."
+config_file = "agents/radek.toml"
+
+[agents.michael]
+description = "Michael — Senior Code Reviewer; mandatory evidence-based review for every PR."
+config_file = "agents/michael.toml"

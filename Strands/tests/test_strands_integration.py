@@ -82,6 +82,28 @@ def test_reviewer_has_no_write_or_shell_tools(wf, settings, tmp_path):
     assert set(m.seen_tools) == {"list_files", "read_file"}
 
 
+def test_invocation_respects_remaining_token_budget(wf, settings, tmp_path, monkeypatch):
+    import strands
+
+    original_agent = strands.Agent
+    observed = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs):
+            self.agent = original_agent(**kwargs)
+
+        def __call__(self, prompt, **kwargs):
+            observed.update(kwargs)
+            return self.agent(prompt, **kwargs)
+
+    monkeypatch.setattr(strands, "Agent", CapturingAgent)
+    inv = StrandsInvoker(settings)
+    inv._models["teddy"] = ScriptedModel([("text", "done")])
+    ctx = ctx_for("teddy", wf, settings, tmp_path, token_budget=37)
+    inv.invoke("teddy", "go", ctx)
+    assert observed["limits"]["total_tokens"] == 37
+
+
 def test_cancel_signal_stops_the_agent_and_runner_treats_it_as_cancelled(wf, settings, tmp_path):
     from legion.runner import Runner
     from legion.tools import Cancelled

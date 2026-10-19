@@ -70,7 +70,7 @@ class Workflow:
         with self.store.lock():
             rec = Record({"name": name, "slug": slugify(name), "status": "awaiting_project_approval",
                           "gate_index": 0, "educational": educational, "merge_count": 0,
-                          "tokens_used": 0, "created": now()}, f"# {name}\n\n{objective.strip()}\n")
+                          "tokens_used": 0, "tokens_reserved": 0, "created": now()}, f"# {name}\n\n{objective.strip()}\n")
             self._save("project", rec)
             self.store.audit("human", "created project", name)
         return rec["slug"]
@@ -164,7 +164,8 @@ class Workflow:
                 raise WorkflowError(f"Duplicate task id: {tid}")
             rec = Record({"id": tid, "title": title.strip(), "agent": agent, "stage": stage, "kind": kind,
                           "status": "blocked", "depends_on": depends_on, "acceptance": acceptance or [],
-                          "description": description, "attempts": 0, "tokens_used": 0, "created_by": created_by,
+                          "description": description, "attempts": 0, "attempt_generation": 0,
+                          "tokens_used": 0, "tokens_reserved": 0, "created_by": created_by,
                           "created": now(), "jira_key": None, "branch": None, "pr": None})
             self.store.log(rec, f"created by {created_by}")
             self._save("tasks", rec)
@@ -214,14 +215,16 @@ class Workflow:
                 raise WorkflowError(f"{task_id} is assigned to {t['agent']}, not {agent}.")
             if t["id"] not in {r["id"] for r in self.runnable()}:
                 raise WorkflowError(f"{task_id} is not runnable (status {t['status']}).")
-            t["status"], t["attempts"], t["started"] = "in_progress", t["attempts"] + 1, now()
-            self.store.log(t, f"claimed by {agent} (attempt {t['attempts']})")
+            t["status"], t["attempts"] = "in_progress", t["attempts"] + 1
+            t["attempt_generation"] = t.get("attempt_generation", t["attempts"] - 1) + 1
+            t["started"] = now()
+            self.store.log(t, f"claimed by {agent} (attempt {t['attempts']}, generation {t['attempt_generation']})")
             self._save("tasks", t)
-            return t["attempts"]
+            return t["attempt_generation"]
 
     def _current(self, task_id: str, attempt: int) -> Record:
         t = self.task(task_id)
-        if t["status"] != "in_progress" or t["attempts"] != attempt:
+        if t["status"] != "in_progress" or t.get("attempt_generation", t["attempts"]) != attempt:
             raise WorkflowError(f"{task_id} attempt {attempt} is no longer the active attempt.")
         return t
 
@@ -261,6 +264,7 @@ class Workflow:
             if t["status"] not in ("failed", "in_progress"):
                 raise WorkflowError("Only failed or interrupted tasks can be retried.")
             t["status"], t["attempts"] = "ready", 0
+            t["attempt_generation"] = t.get("attempt_generation", t["attempts"]) + 1
             self.store.log(t, f"reset by {by}: {reason}")
             self._save("tasks", t)
 
@@ -270,7 +274,8 @@ class Workflow:
         with self.store.lock():
             for t in self.tasks():
                 if t["status"] == "in_progress":
-                    self.fail(t["id"], t["attempts"], "worker interrupted before completion")
+                    self.fail(t["id"], t.get("attempt_generation", t["attempts"]),
+                              "worker interrupted before completion")
                     out.append(t["id"])
         return out
 
@@ -330,6 +335,16 @@ class Workflow:
             e["status"], e["resolved_by"], e["resolved_at"] = "resolved", resolver, now()
             e.body += f"\n## Resolution\n{resolution.strip()}\n"
             self.store.write("escalations", eid, e)
+            if e["kind"] == "review_deadlock" and e.get("task_id"):
+                task = self.task(e["task_id"])
+                pr_id = task.get("pr")
+                if pr_id and self.store.exists("prs", pr_id):
+                    pr = self.store.read("prs", pr_id)
+                    if pr["status"] == "escalated":
+                        pr["status"], pr["round"] = "open", 0
+                        self.store.log(pr, f"reopened by {resolver} after {eid} resolution; prior rounds remain in history")
+                        self.store.write("prs", pr_id, pr)
+                        self.store.audit(resolver, "reopened escalated pull request", f"{pr_id} via {eid}: {resolution[:160]}")
             self.store.audit(resolver, "resolved escalation", eid)
 
     def challenge_decision(self, decision_id: str, raised_by: str, evidence: str) -> str:
@@ -440,18 +455,27 @@ class Workflow:
             self.store.audit("engine", "merged", pr_id)
 
     # -- validation -------------------------------------------------------------------------------------
-    def record_validation(self, tester: str, passed: bool, evidence: str, defects: list[dict] | None = None) -> str:
+    def validation_snapshot(self) -> int:
+        """Return the project merge generation to bind Eleanor's QA run to."""
+        with self.store.lock():
+            return int(self.project()["merge_count"])
+
+    def record_validation(self, tester: str, passed: bool, evidence: str, defects: list[dict] | None = None,
+                          *, expected_merge_count: int | None = None) -> str:
         defects = defects or []
         with self.store.lock():
             if tester != "eleanor":
                 raise WorkflowError("Only Eleanor records validation results.")
             if not evidence.strip():
                 raise WorkflowError("Validation requires evidence.")
+            merge_count = int(self.project()["merge_count"])
+            if expected_merge_count is not None and merge_count != expected_merge_count:
+                raise WorkflowError("Code changed during validation; discard this result and run Eleanor again.")
             if any(d.get("severity") == "critical" for d in defects):
                 passed = False  # Eleanor can block release; criticals always do
             vid = self.store.next_id("validations", "V")
             rec = Record({"id": vid, "tester": tester, "passed": passed, "defects": defects,
-                          "merge_count": self.project()["merge_count"], "created": now()}, evidence.strip() + "\n")
+                          "merge_count": merge_count, "created": now()}, evidence.strip() + "\n")
             self.store.write("validations", vid, rec)
             self.store.audit(tester, "validation", f"{vid} passed={passed}")
             return vid
@@ -461,18 +485,81 @@ class Workflow:
         return vals[-1] if vals else None
 
     # -- budget & status ---------------------------------------------------------------------------------
-    def record_usage(self, task_id: str, tokens: int) -> None:
+    def remaining_task_tokens(self, task_id: str, configured_cap: int) -> int:
         with self.store.lock():
-            if task_id:
-                t = self.task(task_id)
-                t["tokens_used"] += tokens
-                self._save("tasks", t)
+            t = self.task(task_id)
+            return max(0, configured_cap - int(t.get("tokens_used", 0)) - int(t.get("tokens_reserved", 0)))
+
+    def remaining_project_tokens(self, configured_cap: int) -> int:
+        with self.store.lock():
             proj = self.project()
-            proj["tokens_used"] += tokens
+            return max(0, configured_cap - int(proj.get("tokens_used", 0)) - int(proj.get("tokens_reserved", 0)))
+
+    def reserve_usage(self, task_id: str | None, *, configured_task_cap: int,
+                      configured_project_cap: int) -> int:
+        """Atomically reserve up to one model call's token allowance across task and project budgets."""
+        with self.store.lock():
+            proj = self.project()
+            remaining = max(0, configured_project_cap - int(proj.get("tokens_used", 0))
+                            - int(proj.get("tokens_reserved", 0)))
+            task = self.task(task_id) if task_id else None
+            if task:
+                remaining = min(remaining, max(0, configured_task_cap - int(task.get("tokens_used", 0))
+                                               - int(task.get("tokens_reserved", 0))))
+            if remaining <= 0:
+                raise WorkflowError("Token budget exhausted; no model-call allowance remains.")
+            # Reserve one invocation's output allowance so parallel independent tasks and nested
+            # consultations can still use the rest of the project/task budget.
+            amount = min(remaining, int(self.settings.max_output_tokens))
+            proj["tokens_reserved"] = int(proj.get("tokens_reserved", 0)) + amount
+            if task:
+                task["tokens_reserved"] = int(task.get("tokens_reserved", 0)) + amount
+                self._save("tasks", task)
+            self.store.write("project", None, proj)
+            return amount
+
+    def release_usage(self, task_id: str | None, reservation: int) -> None:
+        with self.store.lock():
+            proj = self.project()
+            amount = max(0, int(reservation))
+            proj["tokens_reserved"] = max(0, int(proj.get("tokens_reserved", 0)) - amount)
+            if task_id:
+                task = self.task(task_id)
+                task["tokens_reserved"] = max(0, int(task.get("tokens_reserved", 0)) - amount)
+                self._save("tasks", task)
             self.store.write("project", None, proj)
 
+    def record_usage(self, task_id: str | None, tokens: int, *, reservation: int,
+                     configured_task_cap: int, configured_project_cap: int) -> None:
+        if tokens < 0:
+            raise WorkflowError("Token usage cannot be negative.")
+        with self.store.lock():
+            proj = self.project()
+            task = self.task(task_id) if task_id else None
+            amount = max(0, int(reservation))
+            if amount > int(proj.get("tokens_reserved", 0)) or (task and amount > int(task.get("tokens_reserved", 0))):
+                raise WorkflowError("Token usage reservation is no longer active.")
+            task_used = int(task.get("tokens_used", 0)) if task else 0
+            project_used = int(proj.get("tokens_used", 0))
+            project_reserved = int(proj.get("tokens_reserved", 0)) - amount
+            task_reserved = int(task.get("tokens_reserved", 0)) - amount if task else 0
+            exceeded = (tokens > amount or project_used + tokens + project_reserved > configured_project_cap
+                        or (task and task_used + tokens + task_reserved > configured_task_cap))
+            # The model call has already incurred this usage, even if it ignored its limit. Keep
+            # accounting truthful, release the reservation, and stop the task after persisting.
+            proj["tokens_reserved"] = project_reserved
+            proj["tokens_used"] = project_used + tokens
+            if task:
+                task["tokens_reserved"] = task_reserved
+                task["tokens_used"] = task_used + tokens
+                self._save("tasks", task)
+            self.store.write("project", None, proj)
+            if exceeded:
+                raise WorkflowError("Actual usage exceeded the reserved task or project token budget; usage was recorded.")
+
     def budget_exceeded(self) -> bool:
-        return self.project()["tokens_used"] >= self.settings.max_project_tokens
+        proj = self.project()
+        return int(proj["tokens_used"]) + int(proj.get("tokens_reserved", 0)) >= self.settings.max_project_tokens
 
     def status(self) -> dict:
         proj = self.project()

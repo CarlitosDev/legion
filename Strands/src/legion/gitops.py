@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -12,12 +14,23 @@ from .store import slugify
 
 # (argv, cwd, timeout) -> CompletedProcess; injectable so tests never shell out
 Runner = Callable[[list[str], Path, int], subprocess.CompletedProcess]
+_CHECK_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "VIRTUAL_ENV")
 
 
 def run_process(argv: list[str], cwd: Path, timeout: int = 120) -> subprocess.CompletedProcess:
     # stdin is closed so agent-run commands can never reach an interactive human prompt (e.g. gate approval)
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
                           stdin=subprocess.DEVNULL)
+
+
+def run_check_process(argv: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+    """Run repository-controlled checks without exposing orchestrator credentials."""
+    env = {key: os.environ[key] for key in _CHECK_ENV_ALLOWLIST if key in os.environ}
+    home = Path(tempfile.gettempdir()) / "legion-agent-home"
+    home.mkdir(exist_ok=True)
+    env["HOME"] = str(home)
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, env=env)
 
 
 class GitError(RuntimeError):
@@ -27,7 +40,7 @@ class GitError(RuntimeError):
 class Git:
     def __init__(self, repo: Path, worktree_root: Path, base_branch: str = "main",
                  integration_branch: str = "legion/integration", runner: Runner = run_process):
-        self.repo, self.root = Path(repo), Path(worktree_root)
+        self.repo, self.root = Path(repo).resolve(), Path(worktree_root).resolve()
         self.base, self.integration = base_branch, integration_branch
         self._run = runner
 
@@ -86,7 +99,7 @@ class Git:
         if not command.strip():
             return True, "no check command configured"
         try:
-            p = self._run(shlex.split(command), path, timeout)
+            p = run_check_process(shlex.split(command), path, timeout)
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             return False, f"check could not complete: {exc}"
         return p.returncode == 0, (p.stdout + p.stderr)[-4000:]
@@ -107,7 +120,8 @@ class PullRequestRef:
 class CodeHost(Protocol):
     def open_pr(self, branch: str, title: str, body: str) -> PullRequestRef: ...
     def post_review(self, ref: PullRequestRef, verdict: str, body: str) -> None: ...
-    def merge(self, ref: PullRequestRef, branch: str, title: str) -> None: ...
+    def merge(self, ref: PullRequestRef, branch: str, title: str,
+              expected_head: str | None = None) -> None: ...
 
 
 class LocalCodeHost:
@@ -122,7 +136,7 @@ class LocalCodeHost:
     def post_review(self, ref, verdict, body):
         pass
 
-    def merge(self, ref, branch, title):
+    def merge(self, ref, branch, title, expected_head=None):
         self.git.merge_into_integration(branch, title)
 
 
@@ -152,9 +166,16 @@ class GitHubCodeHost:
         if ref.number:
             self._gh("pr", "comment", str(ref.number), "--body", f"**Michael — {verdict}**\n\n{body}")
 
-    def merge(self, ref, branch, title):
+    def push_current_branch(self, branch: str, cwd: Path) -> None:
+        """Publish the latest locally reviewed task commit before requesting a remote merge."""
+        self.git.git("push", "-u", "origin", branch, cwd=cwd)
+
+    def merge(self, ref, branch, title, expected_head=None):
         if not ref.number:
             raise GitError("No PR number to merge.")
-        self._gh("pr", "merge", str(ref.number), "--squash", "--subject", title)
+        if not expected_head:
+            raise GitError("An expected head SHA is required to merge an approved PR.")
+        self._gh("pr", "merge", str(ref.number), "--squash", "--subject", title,
+                 "--match-head-commit", expected_head)
         wt = self.git.integration_worktree()
         self.git.git("pull", "--ff-only", "origin", self.git.integration, cwd=wt)

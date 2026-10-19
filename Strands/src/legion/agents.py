@@ -57,7 +57,8 @@ class StrandsInvoker:
         model = self._models.get(agent_id) or self._models.setdefault(agent_id, make_model(self.settings, agent_id))
         agent = Agent(model=model, system_prompt=spec.system_prompt(), tools=build_tools(ctx),
                       callback_handler=None, name=spec.name, agent_id=spec.id)
-        kwargs = {"cancel_signal": ctx.cancel, "limits": {"total_tokens": self.settings.max_task_tokens}}
+        token_limit = ctx.token_budget if ctx.token_budget is not None else self.settings.max_task_tokens
+        kwargs = {"cancel_signal": ctx.cancel, "limits": {"total_tokens": token_limit}}
         if structured is not None:
             kwargs["structured_output_model"] = structured
         result = agent(prompt, **kwargs)

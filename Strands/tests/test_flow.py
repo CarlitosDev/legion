@@ -1,3 +1,4 @@
+import threading
 import time
 
 
@@ -32,6 +33,14 @@ def test_full_lifecycle_with_review_loop_and_merge(wf, settings, repo):
         teddy=teddy, michael=lambda p, c, s: next(reviews),
         eleanor=lambda p, c, s: ValidationReport(passed=True, evidence="all green"))
     runner, orch, git = make_stack(wf, settings, repo, inv)
+    pushes = []
+    runner.host.push_current_branch = lambda branch, cwd: pushes.append((branch, cwd))
+    merged = []
+    merge = runner.host.merge
+    def capture_merge(ref, branch, title, expected_head=None):
+        merged.append(expected_head)
+        merge(ref, branch, title)
+    runner.host.merge = capture_merge
 
     wf.add_task("Proposal", "renato", "discovery")
     orch.run()
@@ -50,6 +59,8 @@ def test_full_lifecycle_with_review_loop_and_merge(wf, settings, repo):
     assert (git.integration_worktree() / "api_2.py").exists()           # merged into integration, not main
     assert not (repo / "api_2.py").exists()
     assert inv.calls.count(("michael", "ReviewVerdict")) == 2
+    assert len(pushes) == 1  # repaired content is pushed before Michael reviews it again
+    assert merged == [git.git("rev-parse", "HEAD", cwd=pushes[0][1]).strip()]
 
     wf.add_task("Validate", "eleanor", "validation", depends_on=["T-3"])
     orch.run()
@@ -103,6 +114,57 @@ def test_interrupted_run_resumes(wf, settings, repo):
     wf.claim("T-1", "renato")               # simulate a crash mid-task: left in_progress
     summary = orch.run()
     assert summary.recovered == ["T-1"] and summary.completed == ["T-1"]
+
+
+def test_second_orchestrator_does_not_recover_a_live_attempt(wf, settings, repo):
+    settings.max_parallel_agents = 1
+    entered = threading.Event()
+    release = threading.Event()
+
+    def live(*_):
+        entered.set()
+        release.wait(3)
+        return "doc"
+
+    _, first, _ = make_stack(wf, settings, repo, FakeInvoker(renato=live))
+    wf.add_task("Research", "renato", "discovery")
+    errors = []
+    thread = threading.Thread(target=lambda: first.run())
+    thread.start()
+    assert entered.wait(2)
+    _, second, _ = make_stack(wf, settings, repo, FakeInvoker(renato=lambda *a: "duplicate"))
+    try:
+        second.run()
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        release.set()
+        thread.join(3)
+    assert errors and "already active" in str(errors[0]).lower()
+    assert wf.task("T-1")["status"] == "done"
+
+
+def test_validation_rejects_integration_merge_during_qa(wf, settings, repo):
+    from legion.engine import WorkflowError
+    code = drive_to_implementation(wf)
+    code_attempt = wf.claim(code, "teddy")
+    pr = wf.open_pr(code, "legion/T-1-build", "Build", "teddy")
+    wf.review_pr(pr, "michael", "approved", "reviewed")
+    validation = wf.add_task("Validate", "eleanor", "validation")
+    validation_attempt = wf.claim(validation, "eleanor")
+
+    def merge_during_qa(_prompt, _ctx, _structured):
+        wf.mark_merged(pr)
+        wf.complete(code, code_attempt, "merged")
+        return ValidationReport(passed=True, evidence="checked snapshot")
+
+    runner, _, _ = make_stack(wf, settings, repo, FakeInvoker(eleanor=merge_during_qa))
+    try:
+        runner._validation_task(wf.task(validation), validation_attempt, threading.Event())
+    except WorkflowError as exc:
+        assert "code changed during validation" in str(exc).lower()
+    else:
+        raise AssertionError("validation accepted results for an obsolete integration snapshot")
 
 
 def test_failed_validation_creates_fix_tasks_and_revalidation(wf, settings, repo):

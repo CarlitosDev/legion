@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import fcntl
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable
@@ -39,6 +40,19 @@ class Orchestrator:
         """Run ready tasks until nothing is runnable (a gate, escalation or budget stop is reached).
         Never exceeds max_parallel_agents concurrent workers; a timed-out worker keeps its slot until it
         actually stops, so the cap is real."""
+        lease_path = self.wf.store.root / ".orchestrator.lock"
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        with lease_path.open("a+") as lease:
+            try:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise WorkflowError("An orchestrator is already active for this project.") from exc
+            try:
+                return self._run_locked(max_tasks)
+            finally:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+
+    def _run_locked(self, max_tasks: int | None = None) -> RunSummary:
         wf, s = self.wf, self.settings
         summary = RunSummary(recovered=wf.recover_interrupted())
         for tid in summary.recovered:

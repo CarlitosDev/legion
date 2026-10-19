@@ -91,7 +91,10 @@ class Store:
 
     def list(self, kind: str) -> list[Record]:
         folder = self.root / kind
-        return [self.read(kind, p.stem) for p in sorted(folder.glob("*.md"))] if folder.exists() else []
+        def order(path: Path) -> tuple[str, int, str]:
+            match = re.fullmatch(r"(.+?)-(\d+)", path.stem)
+            return (match.group(1), int(match.group(2)), path.stem) if match else (path.stem, -1, path.stem)
+        return [self.read(kind, p.stem) for p in sorted(folder.glob("*.md"), key=order)] if folder.exists() else []
 
     def next_id(self, kind: str, prefix: str) -> str:
         folder = self.root / kind

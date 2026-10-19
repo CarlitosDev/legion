@@ -71,8 +71,17 @@ class Runner:
 
     def _invoke(self, agent_id: str, prompt: str, ctx: ToolContext, structured=None) -> InvokeResult:
         ctx.check()
-        res = self.invoker.invoke(agent_id, prompt, ctx, structured)
-        self.wf.record_usage(ctx.task_id, res.tokens)
+        reservation = self.wf.reserve_usage(ctx.task_id, configured_task_cap=self.settings.max_task_tokens,
+                                            configured_project_cap=self.settings.max_project_tokens)
+        ctx.token_budget = reservation
+        try:
+            res = self.invoker.invoke(agent_id, prompt, ctx, structured)
+        except BaseException:
+            self.wf.release_usage(ctx.task_id, reservation)
+            raise
+        self.wf.record_usage(ctx.task_id, res.tokens, reservation=reservation,
+                             configured_task_cap=self.settings.max_task_tokens,
+                             configured_project_cap=self.settings.max_project_tokens)
         ctx.check()
         if res.stop_reason.startswith("limit_"):
             raise TaskError(f"{agent_id} stopped at a budget limit ({res.stop_reason})")
@@ -171,7 +180,7 @@ class Runner:
                 if git.git("rev-parse", "HEAD", cwd=path).strip() != head:
                     continue  # code moved during review; the approval no longer covers it
                 wf.authorize_merge(pr_id, True)
-                self.host.merge(ref, branch, f"{t['id']}: {t['title']}")
+                self.host.merge(ref, branch, f"{t['id']}: {t['title']}", expected_head=head)
                 wf.mark_merged(pr_id)
                 wf.complete(t["id"], attempt, f"merged {pr_id}")
                 return
@@ -188,6 +197,8 @@ class Runner:
     def _fix(self, t, ctx, pr_id, instruction: str) -> None:
         self._invoke(t["agent"], self._brief(t, f"PULL REQUEST {pr_id}\n{instruction}"), ctx)
         self.git.commit_all(ctx.workdir, f"{t['id']}: address review feedback")
+        if hasattr(self.host, "push_current_branch"):
+            self.host.push_current_branch(ctx.branch, ctx.workdir)
 
     def _review(self, t, pr, ctx, checks: str) -> ReviewVerdict:
         rctx = ToolContext(ROSTER["michael"], self.wf, self.settings, t["id"], workdir=ctx.workdir,
@@ -212,6 +223,7 @@ class Runner:
         if not self.git:
             raise TaskError("validation needs the git repository (set LEGION_REPO_PATH)")
         wf = self.wf
+        merge_snapshot = wf.validation_snapshot()
         path = self.git.integration_worktree()
         ctx = self._ctx("eleanor", t["id"], cancel, workdir=path)
         criteria = "\n".join(f"- {x['id']} {x['title']}: " + "; ".join(x["acceptance"])
@@ -221,7 +233,8 @@ class Runner:
             "criterion below, using run_command to execute tests and probes. Write extra tests for edge cases "
             "where useful. Report honestly.\n\nCRITERIA OF COMPLETED TASKS\n" + criteria)), ctx, ValidationReport)
         rep: ValidationReport = res.structured  # type: ignore[assignment]
-        wf.record_validation("eleanor", rep.passed, rep.evidence, [d.model_dump() for d in rep.defects])
+        wf.record_validation("eleanor", rep.passed, rep.evidence,
+                             [d.model_dump() for d in rep.defects], expected_merge_count=merge_snapshot)
         report = f"# Validation report\n\nPassed: {rep.passed}\n\n{rep.evidence}\n\n" + "\n".join(
             f"- **{d.severity}** {d.title}: {d.description}" for d in rep.defects)
         rel = f"docs/{t['id']}.md"

@@ -15,7 +15,8 @@ def test_tasks_wait_for_their_gate(wf):
     d = wf.add_task("Proposal", "renato", "discovery")
     g = wf.add_task("Design", "hadrian", "design", depends_on=[d])
     assert [t["id"] for t in wf.runnable()] == [d]
-    a = wf.claim(d, "renato"); wf.complete(d, a, "ok", "x")
+    a = wf.claim(d, "renato")
+    wf.complete(d, a, "ok", "x")
     assert wf.runnable() == []                       # design needs gate 1
     wf.approve_gate("project_approval", "owner", "ok")
     assert [t["id"] for t in wf.runnable()] == [g]
@@ -77,9 +78,11 @@ def test_review_deadlock_escalates_instead_of_blocking_forever(wf):
 
 def test_failed_attempts_retry_then_escalate(wf):
     c = drive_to_implementation(wf)
-    a = wf.claim(c, "teddy"); wf.fail(c, a, "timeout")
+    a = wf.claim(c, "teddy")
+    wf.fail(c, a, "timeout")
     assert wf.task(c)["status"] == "ready"
-    a = wf.claim(c, "teddy"); wf.fail(c, a, "timeout")
+    a = wf.claim(c, "teddy")
+    wf.fail(c, a, "timeout")
     assert wf.task(c)["status"] == "failed"
     assert wf.runnable() == []
     eid = wf.store.list("escalations")[0]["id"]
@@ -98,6 +101,95 @@ def test_stale_attempt_cannot_complete(wf):
         wf.complete(d, a, "late", "x")
 
 
+def test_retry_invalidates_old_attempt_without_reusing_generation(wf):
+    d = wf.add_task("Proposal", "renato", "discovery")
+    old = wf.claim(d, "renato")
+    wf.retry(d, "owner", "replace interrupted worker")
+    new = wf.claim(d, "renato")
+    assert new > old
+    with pytest.raises(WorkflowError, match="no longer the active attempt"):
+        wf.complete(d, old, "stale", "x")
+    wf.complete(d, new, "fresh", "x")
+
+
+def test_resolving_review_deadlock_reopens_pr_for_a_new_review_cycle(wf):
+    c = drive_to_implementation(wf)
+    wf.claim(c, "teddy")
+    pr = wf.open_pr(c, "b", "t", "teddy")
+    for _ in range(2):
+        wf.review_pr(pr, "michael", "changes_requested", "no", [{"severity": "major", "text": "x"}])
+    eid = wf.store.list("escalations")[0]["id"]
+    wf.resolve_escalation(eid, "owner", "Authorize a fresh review cycle after remediation.")
+    assert wf.store.read("prs", pr)["status"] == "open"
+    assert wf.store.read("prs", pr)["round"] == 0
+    wf.resolve_finding(pr, 1, "teddy", "fixed")
+    wf.resolve_finding(pr, 2, "teddy", "fixed")
+    assert wf.review_pr(pr, "michael", "approved", "re-reviewed") == "approved"
+
+
+def test_latest_validation_uses_numeric_id_order(wf):
+    for n in range(1, 10):
+        wf.record_validation("eleanor", True, f"passing validation {n}")
+    wf.record_validation("eleanor", False, "latest validation failed")
+    assert wf.latest_validation()["id"] == "V-10"
+    assert wf.latest_validation()["passed"] is False
+
+
+def test_validation_snapshot_rejects_late_code_merge(wf):
+    c = drive_to_implementation(wf)
+    attempt = wf.claim(c, "teddy")
+    pr = wf.open_pr(c, "b", "t", "teddy")
+    wf.review_pr(pr, "michael", "approved", "ok")
+    wf.mark_merged(pr)
+    wf.complete(c, attempt, "merged")
+    snapshot = wf.validation_snapshot()
+    wf.store.read("project")
+    proj = wf.project()
+    proj["merge_count"] += 1
+    wf.store.write("project", None, proj)
+    with pytest.raises(WorkflowError, match="changed during validation"):
+        wf.record_validation("eleanor", True, "suite green", expected_merge_count=snapshot)
+
+
+def test_usage_is_rejected_atomically_when_task_or_project_cap_would_be_exceeded(wf, settings):
+    d = wf.add_task("Proposal", "renato", "discovery")
+    reservation = wf.reserve_usage(d, configured_task_cap=10, configured_project_cap=20)
+    assert reservation == 10
+    with pytest.raises(WorkflowError, match="budget exhausted"):
+        wf.reserve_usage(d, configured_task_cap=10, configured_project_cap=20)
+    wf.record_usage(d, 7, reservation=reservation, configured_task_cap=10, configured_project_cap=20)
+    assert wf.task(d)["tokens_used"] == 7
+    assert wf.task(d)["tokens_reserved"] == 0
+    assert wf.project()["tokens_used"] == 7
+    assert wf.remaining_task_tokens(d, 10) == 3
+    assert wf.remaining_project_tokens(20) == 13
+
+
+def test_usage_reservation_respects_tighter_project_cap(wf):
+    d = wf.add_task("Proposal", "renato", "discovery")
+    reservation = wf.reserve_usage(d, configured_task_cap=10, configured_project_cap=4)
+    assert reservation == 4
+    wf.record_usage(d, 4, reservation=reservation, configured_task_cap=10, configured_project_cap=4)
+    with pytest.raises(WorkflowError, match="budget exhausted"):
+        wf.reserve_usage(d, configured_task_cap=10, configured_project_cap=4)
+
+
+def test_actual_usage_over_allowance_is_still_recorded(wf, settings):
+    settings.max_project_tokens = 10
+    d = wf.add_task("Proposal", "renato", "discovery")
+    reservation = wf.reserve_usage(d, configured_task_cap=20, configured_project_cap=10)
+    with pytest.raises(WorkflowError, match="usage exceeded"):
+        wf.record_usage(d, reservation + 1, reservation=reservation,
+                        configured_task_cap=20, configured_project_cap=10)
+    assert wf.task(d)["tokens_used"] == reservation + 1
+    assert wf.project()["tokens_used"] == reservation + 1
+    assert wf.task(d)["tokens_reserved"] == 0
+    assert wf.project()["tokens_reserved"] == 0
+    assert wf.remaining_task_tokens(d, 20) == 9
+    assert wf.remaining_project_tokens(10) == 0
+    assert wf.budget_exceeded() is True
+
+
 def test_recover_interrupted_requeues(wf):
     d = wf.add_task("Proposal", "renato", "discovery")
     wf.claim(d, "renato")
@@ -109,7 +201,9 @@ def test_preproduction_needs_fresh_passing_validation(wf):
     c = drive_to_implementation(wf)
     a = wf.claim(c, "teddy")
     pr = wf.open_pr(c, "b", "t", "teddy")
-    wf.review_pr(pr, "michael", "approved", "ok"); wf.mark_merged(pr); wf.complete(c, a, "ok")
+    wf.review_pr(pr, "michael", "approved", "ok")
+    wf.mark_merged(pr)
+    wf.complete(c, a, "ok")
     with pytest.raises(WorkflowError, match="validation"):
         wf.approve_gate("preproduction_approval", "owner", "x")
     wf.record_validation("eleanor", True, "suite green", [{"severity": "critical", "title": "x"}])

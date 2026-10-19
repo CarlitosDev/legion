@@ -1,5 +1,6 @@
 import json
 import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
@@ -7,7 +8,7 @@ from typer.testing import CliRunner
 
 from legion import jira
 from legion.cli import app
-from legion.gitops import Git, GitHubCodeHost, PullRequestRef
+from legion.gitops import Git, GitError, GitHubCodeHost, PullRequestRef
 from legion.tools import guard_command
 
 
@@ -70,9 +71,48 @@ def test_github_host_issues_expected_gh_commands(tmp_path):
     create = next(a for a in seen if a[:3] == ["gh", "pr", "create"])
     assert create[create.index("--base") + 1] == "legion/integration" and "--repo" in create
     host.post_review(ref, "approved", "lgtm")
-    host.merge(ref, "legion/T-3-api", "T-3: API")
+    host.merge(ref, "legion/T-3-api", "T-3: API", expected_head="abc123")
     flat = [" ".join(a) for a in seen]
-    assert any(f.startswith("gh pr comment 7") for f in flat) and any("pr merge 7 --squash" in f for f in flat)
+    assert any(f.startswith("gh pr comment 7") for f in flat)
+    merge = next(a for a in seen if a[:3] == ["gh", "pr", "merge"])
+    assert merge[merge.index("--match-head-commit") + 1] == "abc123"
+
+
+def test_github_merge_requires_reviewed_head_sha(tmp_path):
+    git = Git(tmp_path, tmp_path / "wt", runner=lambda a, c, t: subprocess.CompletedProcess(a, 0, "", ""))
+    host = GitHubCodeHost(git, "CarlitosDev/legion")
+    with pytest.raises(GitError, match="expected head SHA"):
+        host.merge(PullRequestRef(7, None), "branch", "title")
+
+
+def test_check_commands_do_not_inherit_secrets(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("LEGION_TEST_SECRET", "sentinel")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    git = Git(tmp_path, tmp_path / "wt")
+    ok, _ = git.run_checks(tmp_path, "true", 10)
+    assert ok
+    assert "sentinel" not in seen["env"].values()
+    assert "LEGION_TEST_SECRET" not in seen["env"]
+    assert seen["env"].get("PATH") == os.environ.get("PATH")
+
+
+def test_relative_worktree_root_is_resolved_from_invocation_directory(repo, tmp_path, monkeypatch):
+    subfolder = repo / "Strands"
+    subfolder.mkdir()
+    monkeypatch.chdir(subfolder)
+    git = Git(repo, Path(".legion/project/worktrees"), "main", "legion/integration")
+    integration = git.integration_worktree()
+    assert integration.is_absolute()
+    assert integration.exists()
+    assert integration == subfolder / ".legion/project/worktrees/_integration"
 
 
 @pytest.mark.parametrize("cmd,blocked", [

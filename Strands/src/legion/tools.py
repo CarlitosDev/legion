@@ -38,6 +38,7 @@ class ToolContext:
     git: Git | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
     consult: Callable[[str, str, "ToolContext"], str] | None = None
+    token_budget: int | None = None
 
     def check(self) -> None:
         if self.cancel.is_set():
