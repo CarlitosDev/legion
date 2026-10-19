@@ -32,7 +32,8 @@ class Git:
         self._run = runner
 
     def git(self, *args: str, cwd: Path | None = None, check: bool = True, timeout: int = 120) -> str:
-        p = self._run(["git", *args], cwd or self.repo, timeout)
+        # Hooks live in the shared .git, which agent-written scripts could modify: never run them.
+        p = self._run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd or self.repo, timeout)
         if check and p.returncode != 0:
             raise GitError(f"git {' '.join(args)} failed: {(p.stderr or p.stdout).strip()}")
         return p.stdout
